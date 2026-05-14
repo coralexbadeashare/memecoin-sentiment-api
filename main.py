@@ -150,7 +150,11 @@ def payment_payload(path: str, price: str, description: str) -> dict:
         "payTo":              PAYMENT_ADDRESS,
         "maxTimeoutSeconds":  60,
         "asset":              USDC_BASE,
-        "extra":              {"name": "Memecoin Sentiment API", "version": "1.0.0"},
+        "extra":              {
+            "name":         "Memecoin Sentiment API",
+            "version":      "1.0.0",
+            "discoverable": True,
+        },
     }
 
 
