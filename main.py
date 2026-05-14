@@ -54,7 +54,7 @@ PRICE_SINGLE      = os.getenv("PRICE_SINGLE", "0.001")
 PRICE_BATCH       = os.getenv("PRICE_BATCH",  "0.005")
 NETWORK           = os.getenv("NETWORK",      "base")
 USDC_BASE         = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-PAYMENT_ADDRESS   = os.getenv("PAYMENT_ADDRESS", "0x297C1696E92AA78A37Be9F372e29389E71B1A570")
+PAYMENT_ADDRESS   = os.getenv("PAYMENT_ADDRESS", "")
 FACILITATOR_URL   = os.getenv("FACILITATOR_URL", "https://x402.org/facilitator")
 BASE_URL          = os.getenv("BASE_URL", "http://localhost:8000")
 
