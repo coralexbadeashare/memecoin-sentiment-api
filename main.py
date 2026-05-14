@@ -139,11 +139,16 @@ def build_sentiment(ticker: str) -> dict:
 # x402 helpers
 # ---------------------------------------------------------------------------
 
+def _to_atomic(price_usd: str) -> str:
+    """Convert human-readable USD amount to USDC atomic units (6 decimals)."""
+    return str(int(float(price_usd) * 1_000_000))
+
+
 def payment_payload(path: str, price: str, description: str) -> dict:
     return {
         "scheme":             "exact",
         "network":            NETWORK,
-        "maxAmountRequired":  price,
+        "maxAmountRequired":  _to_atomic(price),
         "resource":           f"{BASE_URL}{path}",
         "description":        description,
         "mimeType":           "application/json",
