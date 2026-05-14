@@ -1,11 +1,9 @@
 [build]
-  # These are config values, not secrets — skip scanning their values in code
   [build.environment]
     SECRETS_SCAN_OMIT_KEYS = "NETWORK,PRICE_SINGLE,PRICE_BATCH,PAYMENT_ADDRESS,FACILITATOR_URL,BASE_URL,CDP_PROJECT_ID"
 
 [functions]
   directory = "netlify/functions"
-  node_bundler = "esbuild"
 
 [[redirects]]
   from = "/*"
