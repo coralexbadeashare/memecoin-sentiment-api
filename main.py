@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -6,9 +7,10 @@ import time
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
-import httpx
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from eth_account import Account
+from eth_account.messages import encode_typed_data
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
@@ -50,38 +52,202 @@ app.add_middleware(
 # Config
 # ---------------------------------------------------------------------------
 
-PRICE_SINGLE      = os.getenv("PRICE_SINGLE", "0.001")
-PRICE_BATCH       = os.getenv("PRICE_BATCH",  "0.005")
-NETWORK           = os.getenv("NETWORK",      "base")
-USDC_BASE         = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-PAYMENT_ADDRESS   = os.getenv("PAYMENT_ADDRESS", "")
-FACILITATOR_URL   = os.getenv("FACILITATOR_URL", "https://x402.org/facilitator")
-BASE_URL          = os.getenv("BASE_URL", "http://localhost:8000")
+PRICE_SINGLE    = os.getenv("PRICE_SINGLE", "0.001")
+PRICE_BATCH     = os.getenv("PRICE_BATCH",  "0.005")
+NETWORK         = os.getenv("NETWORK",      "base")
+USDC_BASE       = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "")
+BASE_URL        = os.getenv("BASE_URL", "http://localhost:8000")
+CHAIN_ID        = 8453  # Base mainnet
+
+_ATOMIC_PER_USDC = 1_000_000  # USDC has 6 decimals
+
+def _to_atomic(price_usd: str) -> str:
+    return str(int(float(price_usd) * _ATOMIC_PER_USDC))
+
+PRICE_SINGLE_ATOMIC = _to_atomic(PRICE_SINGLE)
+PRICE_BATCH_ATOMIC  = _to_atomic(PRICE_BATCH)
+
+# ---------------------------------------------------------------------------
+# EIP-3009 local verification
+# ---------------------------------------------------------------------------
+
+_EIP712_DOMAIN_TYPES = [
+    {"name": "name",              "type": "string"},
+    {"name": "version",           "type": "string"},
+    {"name": "chainId",           "type": "uint256"},
+    {"name": "verifyingContract", "type": "address"},
+]
+
+_TRANSFER_WITH_AUTH_TYPES = [
+    {"name": "from",        "type": "address"},
+    {"name": "to",          "type": "address"},
+    {"name": "value",       "type": "uint256"},
+    {"name": "validAfter",  "type": "uint256"},
+    {"name": "validBefore", "type": "uint256"},
+    {"name": "nonce",       "type": "bytes32"},
+]
+
+
+def _verify_eip3009(auth: dict, signature_hex: str) -> Tuple[bool, str]:
+    """Verify EIP-3009 transferWithAuthorization signature locally."""
+    try:
+        now = int(time.time())
+        valid_before = int(auth.get("validBefore", 0))
+        valid_after  = int(auth.get("validAfter",  0))
+
+        if now >= valid_before:
+            return False, "authorization_expired"
+        if now < valid_after:
+            return False, "authorization_not_yet_valid"
+
+        nonce_raw = auth.get("nonce", "0x")
+        nonce_hex = nonce_raw.lstrip("0x")
+        nonce_bytes = bytes.fromhex(nonce_hex.zfill(64))
+
+        typed_data = {
+            "types": {
+                "EIP712Domain": _EIP712_DOMAIN_TYPES,
+                "TransferWithAuthorization": _TRANSFER_WITH_AUTH_TYPES,
+            },
+            "primaryType": "TransferWithAuthorization",
+            "domain": {
+                "name":              "USD Coin",
+                "version":           "2",
+                "chainId":           CHAIN_ID,
+                "verifyingContract": USDC_BASE,
+            },
+            "message": {
+                "from":        auth["from"],
+                "to":          auth["to"],
+                "value":       int(auth["value"]),
+                "validAfter":  valid_after,
+                "validBefore": valid_before,
+                "nonce":       "0x" + nonce_bytes.hex(),
+            },
+        }
+
+        signable  = encode_typed_data(full_message=typed_data)
+        sig_bytes = bytes.fromhex(signature_hex.lstrip("0x"))
+        recovered = Account.recover_message(signable, signature=sig_bytes)
+
+        if recovered.lower() != auth["from"].lower():
+            return False, "invalid_signature"
+
+        return True, ""
+    except Exception as exc:
+        return False, f"verification_error:{exc}"
+
+
+# ---------------------------------------------------------------------------
+# x402 V1 payment flow (compatible with x402-fetch v1.2.0)
+# ---------------------------------------------------------------------------
+
+def _payment_required(path: str, price_atomic: str, description: str) -> JSONResponse:
+    """Return HTTP 402 in x402 V1 format."""
+    body = {
+        "x402Version": 1,
+        "accepts": [{
+            "scheme":             "exact",
+            "network":            NETWORK,        # "base" (legacy V1 string)
+            "maxAmountRequired":  price_atomic,
+            "resource":           f"{BASE_URL}{path}",
+            "description":        description,
+            "mimeType":           "application/json",
+            "payTo":              PAYMENT_ADDRESS,
+            "maxTimeoutSeconds":  60,
+            "asset":              USDC_BASE,
+            "extra": {
+                "name":         "USD Coin",
+                "version":      "2",
+                "discoverable": True,
+            },
+        }],
+    }
+    resp = JSONResponse(status_code=402, content=body)
+    resp.headers["X-Payment-Required"] = json.dumps(body["accepts"][0])
+    resp.headers["X-Price"] = price_atomic
+    return resp
+
+
+async def check_payment(
+    request: Request,
+    price_atomic: str,
+    description: str,
+) -> Tuple[bool, Optional[JSONResponse]]:
+    """
+    Verify x402 payment from X-Payment header.
+    Returns (paid, error_response).
+    """
+    path   = request.url.path
+    header = request.headers.get("x-payment", "")
+
+    if not header:
+        return False, _payment_required(path, price_atomic, description)
+
+    if header.lower() == "test_mode":
+        return True, None
+
+    # Decode base64-encoded V1 payment payload
+    try:
+        decoded = json.loads(base64.b64decode(header + "=="))
+    except Exception:
+        return False, _payment_required(path, price_atomic, description)
+
+    # Extract authorization and signature from V1 payload
+    payload   = decoded.get("payload", {})
+    auth      = payload.get("authorization", {})
+    signature = payload.get("signature", "")
+
+    if not auth or not signature:
+        return False, _payment_required(path, price_atomic, description)
+
+    # Recipient must be our payment address
+    if auth.get("to", "").lower() != PAYMENT_ADDRESS.lower():
+        return False, JSONResponse(
+            status_code=402,
+            content={"error": "wrong_recipient", "expected": PAYMENT_ADDRESS},
+        )
+
+    # Amount must be at least required
+    if int(auth.get("value", 0)) < int(price_atomic):
+        return False, JSONResponse(
+            status_code=402,
+            content={"error": "insufficient_amount"},
+        )
+
+    # Verify EIP-3009 signature locally
+    valid, reason = _verify_eip3009(auth, signature)
+    if not valid:
+        return False, JSONResponse(status_code=402, content={"error": reason})
+
+    return True, None
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
 
 class SentimentResponse(BaseModel):
-    ticker: str = Field(..., example="DOGE", description="Ticker symbol (uppercase)")
-    sentiment: str = Field(..., example="bullish", description="Sentiment label")
-    score: float = Field(..., ge=-1.0, le=1.0, description="Score: -1.0 (very bearish) → 1.0 (very bullish)")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Model confidence")
-    signals: List[str] = Field(..., description="Detected sentiment signals")
-    volume_trend: str = Field(..., description="Current volume trend")
-    social_momentum: str = Field(..., description="Social media momentum")
-    market_phase: str = Field(..., description="Estimated market cycle phase")
-    timestamp: str = Field(..., description="ISO 8601 UTC")
-    request_id: str = Field(..., description="Unique request identifier")
+    ticker:          str   = Field(..., example="DOGE",    description="Ticker symbol (uppercase)")
+    sentiment:       str   = Field(..., example="bullish", description="Sentiment label")
+    score:           float = Field(..., ge=-1.0, le=1.0,   description="Score: -1.0 (very bearish) → 1.0 (very bullish)")
+    confidence:      float = Field(..., ge=0.0, le=1.0,    description="Model confidence")
+    signals:         List[str] = Field(..., description="Detected sentiment signals")
+    volume_trend:    str   = Field(..., description="Current volume trend")
+    social_momentum: str   = Field(..., description="Social media momentum")
+    market_phase:    str   = Field(..., description="Estimated market cycle phase")
+    timestamp:       str   = Field(..., description="ISO 8601 UTC")
+    request_id:      str   = Field(..., description="Unique request identifier")
 
 
 class BatchResponse(BaseModel):
-    count: int
+    count:   int
     results: List[SentimentResponse]
 
 
 # ---------------------------------------------------------------------------
-# Sentiment generation (deterministic within 1-minute windows, random later)
+# Sentiment generation (deterministic within 1-minute windows)
 # ---------------------------------------------------------------------------
 
 _SIGNALS = [
@@ -94,16 +260,16 @@ _SIGNALS = [
 ]
 
 _SENTIMENT_MAP = [
-    (0.6,  1.01, "very_bullish"),
-    (0.2,  0.6,  "bullish"),
-    (-0.2, 0.2,  "neutral"),
-    (-0.6, -0.2, "bearish"),
-    (-1.01,-0.6, "very_bearish"),
+    (0.6,   1.01,  "very_bullish"),
+    (0.2,   0.6,   "bullish"),
+    (-0.2,  0.2,   "neutral"),
+    (-0.6, -0.2,   "bearish"),
+    (-1.01, -0.6,  "very_bearish"),
 ]
 
-_VOLUME_TRENDS    = ["increasing", "decreasing", "stable", "volatile", "spiking"]
-_SOCIAL_MOMENTUM  = ["rising", "falling", "neutral", "viral", "cooling", "dormant"]
-_MARKET_PHASES    = ["accumulation", "markup", "distribution", "markdown", "consolidation"]
+_VOLUME_TRENDS   = ["increasing", "decreasing", "stable", "volatile", "spiking"]
+_SOCIAL_MOMENTUM = ["rising", "falling", "neutral", "viral", "cooling", "dormant"]
+_MARKET_PHASES   = ["accumulation", "markup", "distribution", "markdown", "consolidation"]
 
 
 def _label(score: float) -> str:
@@ -114,11 +280,10 @@ def _label(score: float) -> str:
 
 
 def build_sentiment(ticker: str) -> dict:
-    minute = int(time.time() // 60)
-    seed = int(hashlib.md5(f"{ticker.upper()}:{minute}".encode()).hexdigest(), 16) % (2**32)
-    rng = random.Random(seed)
-
-    score = round(rng.uniform(-1.0, 1.0), 4)
+    minute     = int(time.time() // 60)
+    seed       = int(hashlib.md5(f"{ticker.upper()}:{minute}".encode()).hexdigest(), 16) % (2**32)
+    rng        = random.Random(seed)
+    score      = round(rng.uniform(-1.0, 1.0), 4)
     request_id = hashlib.sha256(f"{ticker}{time.time_ns()}".encode()).hexdigest()[:24]
 
     return {
@@ -136,109 +301,6 @@ def build_sentiment(ticker: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# x402 helpers
-# ---------------------------------------------------------------------------
-
-def _to_atomic(price_usd: str) -> str:
-    """Convert human-readable USD amount to USDC atomic units (6 decimals)."""
-    return str(int(float(price_usd) * 1_000_000))
-
-
-def payment_payload(path: str, price: str, description: str) -> dict:
-    return {
-        "scheme":             "exact",
-        "network":            NETWORK,
-        "maxAmountRequired":  _to_atomic(price),
-        "resource":           f"{BASE_URL}{path}",
-        "description":        description,
-        "mimeType":           "application/json",
-        "payTo":              PAYMENT_ADDRESS,
-        "maxTimeoutSeconds":  60,
-        "asset":              USDC_BASE,
-        "extra":              {
-            "name":         "Memecoin Sentiment API",
-            "version":      "1.0.0",
-            "discoverable": True,
-        },
-    }
-
-
-def _payment_error_response(requirements: dict, error: str, reason: str = "") -> JSONResponse:
-    body: dict = {"x402Version": 1, "error": error, "accepts": [requirements]}
-    if reason:
-        body["reason"] = reason
-    resp = JSONResponse(status_code=402, content=body)
-    resp.headers["X-Payment-Required"] = json.dumps(requirements)
-    resp.headers["X-Price"] = requirements["maxAmountRequired"]
-    return resp
-
-
-async def _verify_with_facilitator(payment_header: str, requirements: dict) -> Tuple[bool, str]:
-    """POST to CDP facilitator /verify — returns (is_valid, reason)."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            resp = await client.post(
-                f"{FACILITATOR_URL}/verify",
-                json={
-                    "x402Version":        1,
-                    "paymentHeader":      payment_header,
-                    "paymentRequirements": [requirements],
-                },
-            )
-        if resp.status_code != 200:
-            return False, f"facilitator_http_{resp.status_code}"
-        body = resp.json()
-        return body.get("isValid", False), body.get("invalidReason") or ""
-    except httpx.TimeoutException:
-        return False, "facilitator_timeout"
-    except Exception as exc:
-        return False, f"facilitator_error:{exc}"
-
-
-async def _settle_with_facilitator(payment_header: str, requirements: dict) -> None:
-    """POST to CDP facilitator /settle — fire-and-forget after response is sent."""
-    try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            await client.post(
-                f"{FACILITATOR_URL}/settle",
-                json={
-                    "x402Version":        1,
-                    "paymentHeader":      payment_header,
-                    "paymentRequirements": [requirements],
-                },
-            )
-    except Exception:
-        pass  # settlement failure is logged server-side by the facilitator
-
-
-async def check_payment(
-    request: Request,
-    path: str,
-    price: str,
-    description: str,
-) -> Tuple[bool, Optional[JSONResponse]]:
-    """
-    Returns (paid, error_response).
-    If paid=True, error_response is None.
-    If paid=False, error_response is the 402 JSONResponse to return.
-    """
-    requirements = payment_payload(path, price, description)
-    header = request.headers.get("X-Payment", "")
-
-    if not header:
-        return False, _payment_error_response(requirements, "payment_required")
-
-    if header == "test_mode":
-        return True, None
-
-    valid, reason = await _verify_with_facilitator(header, requirements)
-    if not valid:
-        return False, _payment_error_response(requirements, "payment_invalid", reason)
-
-    return True, None
-
-
-# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -251,10 +313,10 @@ async def root():
         "pricing":   {"single": f"{PRICE_SINGLE} USDC", "batch": f"{PRICE_BATCH} USDC"},
         "network":   NETWORK,
         "discovery": {
-            "llms_txt":   "/llms.txt",
+            "llms_txt":    "/llms.txt",
             "x402_schema": "/.well-known/x402.json",
-            "openapi":    "/openapi.json",
-            "docs":       "/docs",
+            "openapi":     "/openapi.json",
+            "docs":        "/docs",
         },
     }
 
@@ -270,28 +332,15 @@ async def root():
         422: {"description": "Invalid ticker"},
     },
 )
-async def get_sentiment(
-    ticker: str,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_payment: Optional[str] = Header(None, description="x402 payment proof or 'test_mode'"),
-):
+async def get_sentiment(ticker: str, request: Request):
     ticker = ticker.strip().upper()
     if not ticker.isalpha() or not (1 <= len(ticker) <= 10):
-        raise HTTPException(status_code=422, detail="Ticker must be 1-10 alphabetic characters")
-
-    path = f"/sentiment/{ticker}"
-    paid, err = await check_payment(request, path, PRICE_SINGLE, f"Sentiment analysis for {ticker}")
+        raise Exception  # caught below
+    paid, err = await check_payment(
+        request, PRICE_SINGLE_ATOMIC, f"Sentiment analysis for {ticker}"
+    )
     if not paid:
         return err
-
-    payment_header = request.headers.get("X-Payment", "")
-    if payment_header != "test_mode":
-        background_tasks.add_task(
-            _settle_with_facilitator,
-            payment_header,
-            payment_payload(path, PRICE_SINGLE, f"Sentiment analysis for {ticker}"),
-        )
 
     data = build_sentiment(ticker)
     resp = JSONResponse(content=data)
@@ -311,29 +360,21 @@ async def get_sentiment(
         422: {"description": "No valid tickers"},
     },
 )
-async def get_batch(
-    tickers: str,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_payment: Optional[str] = Header(None),
-):
-    paid, err = await check_payment(request, "/batch", PRICE_BATCH, "Batch sentiment (up to 10 tickers)")
+async def get_batch(tickers: str, request: Request):
+    paid, err = await check_payment(
+        request, PRICE_BATCH_ATOMIC, "Batch sentiment (up to 10 tickers)"
+    )
     if not paid:
         return err
-
-    payment_header = request.headers.get("X-Payment", "")
-    if payment_header != "test_mode":
-        background_tasks.add_task(
-            _settle_with_facilitator,
-            payment_header,
-            payment_payload("/batch", PRICE_BATCH, "Batch sentiment (up to 10 tickers)"),
-        )
 
     ticker_list = [t.strip().upper() for t in tickers.split(",")]
     ticker_list = [t for t in ticker_list if t.isalpha() and 1 <= len(t) <= 10][:10]
 
     if not ticker_list:
-        raise HTTPException(status_code=422, detail="No valid tickers provided")
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "No valid tickers provided"},
+        )
 
     results = [build_sentiment(t) for t in ticker_list]
     return {"count": len(results), "results": results}
@@ -345,7 +386,7 @@ async def get_batch(
 
 @app.get("/llms.txt", include_in_schema=False, tags=["Discovery"])
 async def llms_txt():
-    body = """\
+    body = f"""\
 # Memecoin Sentiment API
 
 > Real-time sentiment analysis for memecoins. Built for AI agent consumption via the x402 micropayment protocol.
@@ -362,7 +403,7 @@ async def llms_txt():
 
 ### Single ticker
 ```
-GET /sentiment/{TICKER}
+GET /sentiment/{{TICKER}}
 X-Payment: <x402_proof>
 ```
 Example: `GET /sentiment/DOGE`
@@ -383,23 +424,23 @@ X-Payment: test_mode
 
 | Endpoint  | Price (USDC) |
 |-----------|-------------|
-| /sentiment/{ticker} | 0.001 |
-| /batch (≤10 tickers) | 0.005 |
+| /sentiment/{{ticker}} | {PRICE_SINGLE} |
+| /batch (≤10 tickers) | {PRICE_BATCH} |
 
-Payment asset: USDC on Base (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`)
+Payment asset: USDC on Base (`{USDC_BASE}`)
 
 ## Payment Flow (x402)
 
 1. Call endpoint without `X-Payment` header
 2. Receive HTTP 402 with `X-Payment-Required` JSON header
-3. Pay on-chain via CDP or PayAI facilitator
-4. Retry with `X-Payment: <proof>` header
+3. Pay on-chain via EIP-3009 transferWithAuthorization
+4. Retry with `X-Payment: <base64-encoded-payload>` header
 5. Receive sentiment JSON
 
 ## Response Schema
 
 ```json
-{
+{{
   "ticker": "DOGE",
   "sentiment": "bullish",
   "score": 0.73,
@@ -410,7 +451,7 @@ Payment asset: USDC on Base (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`)
   "market_phase": "markup",
   "timestamp": "2026-05-14T12:00:00+00:00",
   "request_id": "a3f7c9d2e1b04a8f9c21"
-}
+}}
 ```
 
 ## Machine-Readable Resources
@@ -426,7 +467,6 @@ Payment asset: USDC on Base (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`)
 async def x402_well_known():
     schema = {
         "version":        "1",
-        "facilitator":    "https://x402.org/facilitator",
         "network":        NETWORK,
         "paymentAddress": PAYMENT_ADDRESS,
         "endpoints": [
