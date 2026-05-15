@@ -176,7 +176,7 @@ def _payment_error_response(requirements: dict, error: str, reason: str = "") ->
 async def _verify_with_facilitator(payment_header: str, requirements: dict) -> Tuple[bool, str]:
     """POST to CDP facilitator /verify — returns (is_valid, reason)."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             resp = await client.post(
                 f"{FACILITATOR_URL}/verify",
                 json={
@@ -198,7 +198,7 @@ async def _verify_with_facilitator(payment_header: str, requirements: dict) -> T
 async def _settle_with_facilitator(payment_header: str, requirements: dict) -> None:
     """POST to CDP facilitator /settle — fire-and-forget after response is sent."""
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             await client.post(
                 f"{FACILITATOR_URL}/settle",
                 json={
