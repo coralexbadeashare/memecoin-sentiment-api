@@ -577,52 +577,74 @@ Payment asset: USDC on Base (`{USDC_BASE}`)
 
 
 @app.get("/.well-known/x402.json", include_in_schema=False, tags=["Discovery"])
+@app.get("/.well-known/x402",      include_in_schema=False, tags=["Discovery"])
 async def x402_well_known():
+    """CDP Bazaar-compatible service registration (crawled after settlement)."""
+    endpoint_single = {
+        "name":        "Memecoin Sentiment",
+        "method":      "GET",
+        "path":        "/sentiment/{ticker}",
+        "url":         f"{BASE_URL}/sentiment/{{ticker}}",
+        "price":       f"${PRICE_SINGLE}",
+        "pricing":     {"amount": PRICE_SINGLE, "currency": "USDC", "network": "eip155:8453"},
+        "category":    "Finance",
+        "tags":        ["memecoin", "sentiment", "crypto", "trading", "agents"],
+        "summary":     f"Real-time sentiment score (-1 to +1) for any memecoin ticker. {PRICE_SINGLE} USDC.",
+        "description": "Sentiment analysis for a single memecoin ticker — score, label, signals, volume trend, social momentum.",
+        "docs_url":    f"{BASE_URL}/docs",
+        "openapi_url": f"{BASE_URL}/openapi.json",
+    }
+    endpoint_batch = {
+        "name":        "Batch Memecoin Sentiment",
+        "method":      "GET",
+        "path":        "/batch",
+        "url":         f"{BASE_URL}/batch",
+        "price":       f"${PRICE_BATCH}",
+        "pricing":     {"amount": PRICE_BATCH, "currency": "USDC", "network": "eip155:8453"},
+        "category":    "Finance",
+        "tags":        ["memecoin", "sentiment", "crypto", "batch", "trading", "agents"],
+        "summary":     f"Batch sentiment for up to 10 tickers. {PRICE_BATCH} USDC.",
+        "description": "Batch sentiment analysis for up to 10 comma-separated memecoin tickers in a single call.",
+        "docs_url":    f"{BASE_URL}/docs",
+        "openapi_url": f"{BASE_URL}/openapi.json",
+    }
     schema = {
-        "version":        "1",
-        "network":        NETWORK,
-        "paymentAddress": PAYMENT_ADDRESS,
-        "endpoints": [
-            {
-                "path":        "/sentiment/{ticker}",
-                "method":      "GET",
-                "description": "Sentiment analysis for a single memecoin ticker",
-                "price": {
-                    "amount":   PRICE_SINGLE,
-                    "currency": "USDC",
-                    "asset":    USDC_BASE,
-                },
-                "parameters": {
-                    "ticker": {
-                        "in":          "path",
-                        "type":        "string",
-                        "description": "Memecoin ticker symbol, e.g. DOGE, PEPE, SHIB",
-                        "maxLength":   10,
-                    }
-                },
-                "responseSchema": {"$ref": "/openapi.json#/components/schemas/SentimentResponse"},
-            },
-            {
-                "path":        "/batch",
-                "method":      "GET",
-                "description": "Sentiment for up to 10 tickers in one call",
-                "price": {
-                    "amount":   PRICE_BATCH,
-                    "currency": "USDC",
-                    "asset":    USDC_BASE,
-                },
-                "parameters": {
-                    "tickers": {
-                        "in":          "query",
-                        "type":        "string",
-                        "description": "Comma-separated tickers, e.g. DOGE,PEPE,SHIB",
-                    }
-                },
-            },
+        "version":           1,
+        "category":          "Finance",
+        "provider":          "Memecoin Sentiment API",
+        "providerName":      "Memecoin Sentiment API",
+        "homepageUrl":       BASE_URL,
+        "docsUrl":           f"{BASE_URL}/docs",
+        "openapiUrl":        f"{BASE_URL}/openapi.json",
+        "llmsUrl":           f"{BASE_URL}/llms.txt",
+        "x402WellKnownUrl":  f"{BASE_URL}/.well-known/x402",
+        "discoverable":      True,
+        "tags":              ["memecoin", "sentiment", "crypto", "trading", "defi", "agents", "x402"],
+        "description":       (
+            "Real-time sentiment analysis for memecoins. "
+            "Returns score (-1 to +1), label, signals, volume trend, social momentum, "
+            "and market phase for any memecoin ticker. Built for AI agent consumption via x402."
+        ),
+        "instructions":      (
+            "Call GET /sentiment/{TICKER} (e.g. /sentiment/DOGE) with X-Payment header. "
+            "For batches use GET /batch?tickers=DOGE,PEPE,SHIB. "
+            "See /llms.txt for full agent instructions."
+        ),
+        "resources":         [
+            f"{BASE_URL}/sentiment/{{ticker}}",
+            f"{BASE_URL}/batch",
         ],
-        "discovery": {
-            "llms_txt": "/llms.txt",
-            "openapi":  "/openapi.json",
+        "endpoints":         [endpoint_single, endpoint_batch],
+        "service": {
+            "id":           "memecoin-sentiment-api",
+            "name":         "Memecoin Sentiment API",
+            "category":     "Finance",
+            "provider":     "Memecoin Sentiment API",
+            "providerName": "Memecoin Sentiment API",
+            "paid_base_url": BASE_URL,
+            "docs_url":     f"{BASE_URL}/docs",
+            "openapi_url":  f"{BASE_URL}/openapi.json",
+            "llms_url":     f"{BASE_URL}/llms.txt",
         },
     }
     return JSONResponse(content=schema)
