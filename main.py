@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -7,6 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
+import httpx
 from dotenv import load_dotenv
 from eth_account import Account
 from eth_account.messages import encode_typed_data
@@ -58,7 +60,8 @@ NETWORK         = os.getenv("NETWORK",      "base")
 USDC_BASE       = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "")
 BASE_URL        = os.getenv("BASE_URL", "http://localhost:8000")
-CHAIN_ID        = 8453  # Base mainnet
+CHAIN_ID            = 8453  # Base mainnet
+CDP_FACILITATOR_URL = os.getenv("CDP_FACILITATOR_URL", "https://api.cdp.coinbase.com/platform/v2/x402")
 
 _ATOMIC_PER_USDC = 1_000_000  # USDC has 6 decimals
 
@@ -137,6 +140,67 @@ def _verify_eip3009(auth: dict, signature_hex: str) -> Tuple[bool, str]:
         return True, ""
     except Exception as exc:
         return False, f"verification_error:{exc}"
+
+
+# ---------------------------------------------------------------------------
+# CDP facilitator settlement (triggers Bazaar indexing via discoverable:true)
+# ---------------------------------------------------------------------------
+
+async def _settle_with_cdp(
+    auth: dict,
+    signature: str,
+    price_atomic: str,
+    resource_url: str,
+    description: str,
+) -> None:
+    """Fire-and-forget settle call to CDP facilitator so it indexes us in Bazaar."""
+    body = {
+        "x402Version": 2,
+        "paymentPayload": {
+            "x402Version": 2,
+            "scheme": "exact",
+            "network": "eip155:8453",
+            "payload": {
+                "signature": signature if signature.startswith("0x") else f"0x{signature}",
+                "authorization": {
+                    "from":        auth["from"],
+                    "to":          auth["to"],
+                    "value":       str(int(auth["value"])),
+                    "validAfter":  str(int(auth.get("validAfter", 0))),
+                    "validBefore": str(int(auth.get("validBefore", 0))),
+                    "nonce":       auth.get("nonce", "0x"),
+                },
+            },
+        },
+        "paymentRequirements": {
+            "scheme":             "exact",
+            "network":            "eip155:8453",
+            "amount":             price_atomic,
+            "resource":           resource_url,
+            "description":        description,
+            "mimeType":           "application/json",
+            "payTo":              PAYMENT_ADDRESS,
+            "maxTimeoutSeconds":  60,
+            "asset":              USDC_BASE,
+            "outputSchema":       None,
+            "extra": {
+                "name":         "USD Coin",
+                "version":      "2",
+                "discoverable": True,
+            },
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{CDP_FACILITATOR_URL}/settle", json=body)
+            status = resp.status_code
+            snippet = resp.text[:300]
+            if status in (200, 201):
+                print(f"[x402] CDP settle OK ({status}): {snippet}")
+            else:
+                print(f"[x402] CDP settle {status}: {snippet}")
+    except Exception as exc:
+        print(f"[x402] CDP settle error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +284,12 @@ async def check_payment(
     valid, reason = _verify_eip3009(auth, signature)
     if not valid:
         return False, JSONResponse(status_code=402, content={"error": reason})
+
+    # Fire-and-forget: notify CDP facilitator for Bazaar indexing
+    resource_url = f"{BASE_URL}{path}"
+    asyncio.create_task(
+        _settle_with_cdp(auth, signature, price_atomic, resource_url, description)
+    )
 
     return True, None
 
