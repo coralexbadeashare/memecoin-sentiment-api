@@ -4,11 +4,13 @@ import hashlib
 import json
 import os
 import random
+import secrets
 import time
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 import httpx
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from dotenv import load_dotenv
 from eth_account import Account
 from eth_account.messages import encode_typed_data
@@ -146,6 +148,40 @@ def _verify_eip3009(auth: dict, signature_hex: str) -> Tuple[bool, str]:
 # CDP facilitator settlement (triggers Bazaar indexing via discoverable:true)
 # ---------------------------------------------------------------------------
 
+_CDP_API_KEY_ID     = os.getenv("CDP_API_KEY_ID", "")
+_CDP_API_KEY_SECRET = os.getenv("CDP_API_KEY_SECRET", "")
+
+
+def _cdp_jwt(method: str, path: str) -> str:
+    """Build a signed EdDSA JWT for authenticating to CDP REST endpoints."""
+    if not _CDP_API_KEY_ID or not _CDP_API_KEY_SECRET:
+        return ""
+    try:
+        key_bytes = base64.b64decode(_CDP_API_KEY_SECRET)
+        private_key = Ed25519PrivateKey.from_private_bytes(key_bytes[:32])
+        now = int(time.time())
+        nonce = secrets.token_hex(16)
+        header  = {"alg": "EdDSA", "kid": _CDP_API_KEY_ID, "typ": "JWT", "nonce": nonce}
+        payload = {
+            "sub":  _CDP_API_KEY_ID,
+            "iss":  "cdp",
+            "nbf":  now,
+            "iat":  now,
+            "exp":  now + 120,
+            "uris": [f"{method} api.cdp.coinbase.com/platform{path}"],
+        }
+        def _b64(obj: dict) -> str:
+            return base64.urlsafe_b64encode(
+                json.dumps(obj, separators=(",", ":")).encode()
+            ).rstrip(b"=").decode()
+        signing_input = f"{_b64(header)}.{_b64(payload)}".encode()
+        sig = base64.urlsafe_b64encode(private_key.sign(signing_input)).rstrip(b"=").decode()
+        return f"{_b64(header)}.{_b64(payload)}.{sig}"
+    except Exception as exc:
+        print(f"[x402] CDP JWT error: {exc}")
+        return ""
+
+
 async def _settle_with_cdp(
     auth: dict,
     signature: str,
@@ -154,14 +190,26 @@ async def _settle_with_cdp(
     description: str,
 ) -> None:
     """Fire-and-forget settle call to CDP facilitator so it indexes us in Bazaar."""
+    requirements_v2 = {
+        "scheme":            "exact",
+        "network":           "eip155:8453",
+        "asset":             USDC_BASE,
+        "amount":            price_atomic,
+        "payTo":             PAYMENT_ADDRESS,
+        "maxTimeoutSeconds": 60,
+        "extra": {
+            "name":         "USD Coin",
+            "version":      "2",
+            "discoverable": True,
+        },
+    }
+    sig = signature if signature.startswith("0x") else f"0x{signature}"
     body = {
         "x402Version": 2,
         "paymentPayload": {
             "x402Version": 2,
-            "scheme": "exact",
-            "network": "eip155:8453",
             "payload": {
-                "signature": signature if signature.startswith("0x") else f"0x{signature}",
+                "signature": sig,
                 "authorization": {
                     "from":        auth["from"],
                     "to":          auth["to"],
@@ -171,28 +219,23 @@ async def _settle_with_cdp(
                     "nonce":       auth.get("nonce", "0x"),
                 },
             },
-        },
-        "paymentRequirements": {
-            "scheme":             "exact",
-            "network":            "eip155:8453",
-            "amount":             price_atomic,
-            "resource":           resource_url,
-            "description":        description,
-            "mimeType":           "application/json",
-            "payTo":              PAYMENT_ADDRESS,
-            "maxTimeoutSeconds":  60,
-            "asset":              USDC_BASE,
-            "outputSchema":       None,
-            "extra": {
-                "name":         "USD Coin",
-                "version":      "2",
-                "discoverable": True,
+            "accepted":  requirements_v2,
+            "resource": {
+                "url":         resource_url,
+                "description": description,
+                "mimeType":    "application/json",
             },
         },
+        "paymentRequirements": requirements_v2,
     }
+    jwt = _cdp_jwt("POST", "/v2/x402/settle")
+    headers = {"Content-Type": "application/json"}
+    if jwt:
+        headers["Authorization"] = f"Bearer {jwt}"
+        headers["Correlation-Context"] = "sdk_version=1.0.0,sdk_language=python,source=memecoin-sentiment-api"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(f"{CDP_FACILITATOR_URL}/settle", json=body)
+            resp = await client.post(f"{CDP_FACILITATOR_URL}/settle", json=body, headers=headers)
             status = resp.status_code
             snippet = resp.text[:300]
             if status in (200, 201):
